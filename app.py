@@ -5,16 +5,19 @@ import datetime
 import io
 import logging
 
+import pandas as pd
 import streamlit as st
 
+from batch import TEMPLATE_CSV, load_batch, results_csv, run_batch, summarize
 from gemini_client import AIError
 from judge import (
-    DEFAULT_CRITERIA,
+    MAX_CRITERIA,
     MAX_PROMPT_CHARS,
     MAX_REFERENCE_CHARS,
     MAX_RESPONSE_CHARS,
     evaluate,
 )
+from rubrics import PRESETS, RubricError, clean_criteria, rubric_from_json, rubric_to_json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,25 +47,71 @@ def load_example():
         st.session_state[key] = value
 
 
+def criteria_frame(criteria):
+    return pd.DataFrame(
+        [{"Criterion": n, "Description": d} for n, d in criteria.items()],
+        columns=["Criterion", "Description"],
+    )
+
+
+def set_rubric(name, criteria):
+    """Replace the rubric being edited. Bumping the version resets the editor widget."""
+    st.session_state.rubric_name = name
+    st.session_state.rubric_frame = criteria_frame(criteria)
+    st.session_state.rubric_version = st.session_state.get("rubric_version", 0) + 1
+
+
 def render_sidebar():
-    """Criteria and options. Returns (criteria dict, bias_check flag)."""
-    st.sidebar.header("Scoring setup")
-    chosen = st.sidebar.multiselect(
-        "Criteria", list(DEFAULT_CRITERIA), default=list(DEFAULT_CRITERIA)
-    )
-    criteria = {name: DEFAULT_CRITERIA[name] for name in chosen}
+    """Rubric editor and options. Returns (criteria dict, bias_check flag)."""
+    if "rubric_frame" not in st.session_state:
+        first = next(iter(PRESETS))
+        set_rubric(first, PRESETS[first])
 
-    custom = st.sidebar.text_input(
-        "Custom criterion (optional)", max_chars=200, placeholder="e.g. Tone: friendly and professional"
-    )
-    if custom.strip():
-        name, _, desc = custom.partition(":")
-        if name.strip():
-            criteria[name.strip()] = desc.strip() or name.strip()
+    st.sidebar.header("Scoring rubric")
+    preset = st.sidebar.selectbox("Start from a preset", ["—", *PRESETS], key="preset_choice")
+    if preset != "—" and st.sidebar.button("Load preset", width="stretch"):
+        set_rubric(preset, PRESETS[preset])
+        st.rerun()
 
+    uploaded = st.sidebar.file_uploader("Or load a saved rubric (.json)", type="json")
+    if uploaded is not None and st.session_state.get("loaded_rubric_id") != uploaded.file_id:
+        st.session_state.loaded_rubric_id = uploaded.file_id
+        try:
+            name, criteria = rubric_from_json(uploaded.getvalue().decode("utf-8", errors="replace"))
+            set_rubric(name, criteria)
+            st.rerun()
+        except RubricError as error:
+            st.sidebar.error(str(error))
+
+    st.sidebar.caption(f"Edit, add or delete rows. Up to {MAX_CRITERIA} criteria.")
+    edited = st.sidebar.data_editor(
+        st.session_state.rubric_frame,
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        key=f"rubric_editor_{st.session_state.rubric_version}",
+        column_config={
+            "Criterion": st.column_config.TextColumn(required=True, max_chars=60),
+            "Description": st.column_config.TextColumn(max_chars=300),
+        },
+    )
+    try:
+        criteria = clean_criteria(zip(edited["Criterion"], edited["Description"]))
+    except RubricError as error:
+        st.sidebar.error(str(error))
+        criteria = {}
+
+    name = st.sidebar.text_input("Rubric name", key="rubric_name", max_chars=60)
+    st.sidebar.download_button(
+        "Save rubric (.json)", rubric_to_json(name, criteria) if criteria else "{}",
+        file_name=f"{(name or 'rubric').strip().replace(' ', '_').lower()}.json",
+        mime="application/json", disabled=not criteria, width="stretch",
+    )
+
+    st.sidebar.divider()
     bias_check = st.sidebar.checkbox(
         "Position-bias check",
-        help="Runs the judge twice with A and B swapped and flags it if the winner changes. Uses 2 API calls.",
+        help="Runs the judge twice with A and B swapped and flags it if the winner changes. Uses 2 API calls per comparison.",
     )
     st.sidebar.caption("Scores run from 1 (very poor) to 5 (excellent).")
     return criteria, bias_check
@@ -123,15 +172,8 @@ def history_csv(history):
     return buffer.getvalue()
 
 
-def main():
-    st.set_page_config(page_title="LLM Response Evaluator", page_icon="⚖️", layout="wide")
-    st.title("⚖️ LLM Response Evaluator")
-    st.markdown("Compare two AI responses side by side, scored against a rubric by an AI judge.")
-
-    criteria, bias_check = render_sidebar()
+def render_single(criteria, bias_check):
     render_inputs()
-    st.session_state.setdefault("history", [])
-
     if st.button("Evaluate", type="primary", width="stretch"):
         with st.spinner("Judging responses..."):
             try:
@@ -169,7 +211,86 @@ def main():
             "Download all evaluations (CSV)", history_csv(st.session_state.history),
             file_name="evaluations.csv", mime="text/csv",
         )
-        st.caption("AI judges can be wrong. Use these scores to support human review, not replace it.")
+
+
+def render_batch_summary(summary, results):
+    counts = summary["counts"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Evaluated", summary["evaluated"], help=f"{summary['failed']} row(s) failed" if summary["failed"] else None)
+    c2.metric("A win rate", f"{summary['win_rate_a']:.0%}", f"{counts['A']} wins", delta_color="off")
+    c3.metric("B win rate", f"{summary['win_rate_b']:.0%}", f"{counts['B']} wins", delta_color="off")
+    c4.metric("Ties / inconsistent", f"{counts['tie']} / {counts['inconsistent']}")
+
+    if summary["averages"]:
+        st.markdown("**Average score per criterion** (1–5)")
+        averages = pd.DataFrame(summary["averages"]).set_index("criterion")
+        averages.columns = ["Response A", "Response B"]
+        st.bar_chart(averages, stack=False, y_label="Average score", height=280)
+
+    table = [{
+        "Row": r["row"],
+        "Prompt": r["prompt"][:120],
+        "Winner": r["verdict"]["winner"] if r["verdict"] else "—",
+        "A total": r["verdict"]["total_a"] if r["verdict"] else None,
+        "B total": r["verdict"]["total_b"] if r["verdict"] else None,
+        "Error": r["error"] or "",
+    } for r in results]
+    st.dataframe(table, hide_index=True, width="stretch")
+    st.download_button("Download batch results (CSV)", results_csv(results),
+                       file_name="batch_evaluations.csv", mime="text/csv")
+
+
+def render_batch(criteria, bias_check):
+    st.markdown(
+        "Upload a CSV with `prompt`, `response_a` and `response_b` columns (plus an optional "
+        "`reference`). Every row is judged with the current rubric."
+    )
+    st.download_button("Download CSV template", TEMPLATE_CSV, file_name="batch_template.csv", mime="text/csv")
+    uploaded = st.file_uploader("Batch CSV", type="csv", label_visibility="collapsed")
+    if uploaded is None:
+        return
+    try:
+        rows, notes = load_batch(pd.read_csv(uploaded, dtype=str, keep_default_na=False))
+    except AIError as error:
+        st.error(str(error))
+        return
+    except Exception:
+        logger.exception("Failed to read batch CSV")
+        st.error("That file couldn't be read as a CSV. Check it opens in a spreadsheet app.")
+        return
+    for note in notes:
+        st.info(note)
+
+    calls = len(rows) * (2 if bias_check else 1)
+    st.caption(f"{len(rows)} row(s) ready. This uses about {calls} API call(s); free-tier rate limits may apply.")
+    if st.button(f"Evaluate {len(rows)} row(s)", type="primary", disabled=not criteria):
+        bar = st.progress(0.0, text="Judging batch...")
+        results = run_batch(rows, criteria, bias_check,
+                            progress=lambda p: bar.progress(p, text="Judging batch..."))
+        bar.empty()
+        st.session_state.batch = {"results": results, "summary": summarize(results, list(criteria))}
+
+    if st.session_state.get("batch"):
+        render_batch_summary(st.session_state.batch["summary"], st.session_state.batch["results"])
+
+
+def main():
+    st.set_page_config(page_title="LLM Response Evaluator", page_icon="⚖️", layout="wide")
+    st.title("⚖️ LLM Response Evaluator")
+    st.markdown("Compare AI responses against a rubric with an AI judge: one pair at a time, or a whole CSV at once.")
+
+    criteria, bias_check = render_sidebar()
+    st.session_state.setdefault("history", [])
+    if not criteria:
+        st.warning("Add at least one criterion to the rubric in the sidebar.")
+
+    single, batch = st.tabs(["Single comparison", "Batch (CSV)"])
+    with single:
+        render_single(criteria, bias_check)
+    with batch:
+        render_batch(criteria, bias_check)
+
+    st.caption("AI judges can be wrong. Use these scores to support human review, not replace it.")
 
 
 if __name__ == "__main__":
