@@ -2,19 +2,21 @@
 
 ![Tests](https://github.com/quantamsage/llm-response-evaluator/actions/workflows/tests.yml/badge.svg)
 
-A Streamlit app that compares two AI responses to the same prompt and scores them against a rubric, using Google Gemini as the judge. It includes an optional position-bias check that re-runs the judgement with the responses swapped and flags it when the verdict changes.
+A Streamlit app that compares two AI responses to the same prompt and scores them against a rubric, using Google Gemini as the judge. Compare one pair at a time, or upload a CSV and score a whole batch. It includes an optional position-bias check that re-runs the judgement with the responses swapped and flags it when the verdict changes.
 
 Built to show structured LLM evaluation in practice: rubric-based scoring, schema-validated JSON output, and a simple guard against one of the best-known weaknesses of LLM judges.
 
 ## Features
 
 - Paste a prompt and two responses, and get a 1–5 score per criterion for each response, a winner, and the judge's reasoning
-- Five built-in criteria (Accuracy, Helpfulness, Instruction following, Clarity, Safety), selectable in the sidebar, plus one custom criterion
+- **Editable rubric:** criteria and descriptions are an editable table in the sidebar (add, rename, delete), with presets for general answers, code answers and customer support
+- **Saved rubrics:** download the current rubric as JSON and load it again later, so the same criteria are reused across sessions and shared with teammates
+- **Batch mode:** upload a CSV of `prompt`, `response_a`, `response_b` (and optional `reference`), score every row, and get win rates, ties, a per-criterion average chart and a full CSV of results. A row that fails is recorded and the batch carries on
 - Optional reference answer the judge uses to check correctness
 - **Position-bias check:** runs the judge twice with A and B swapped, averages the scores, and warns if the winner flips
 - Every reply from the model is validated: all criteria must be scored, scores are clamped to 1–5, and the winner must be A, B or tie
 - Session history with CSV export of every evaluation
-- "Load example" button for a quick demo
+- "Load example" button and a downloadable batch CSV template for a quick demo
 - Friendly error messages for a missing or invalid API key, rate limits, network problems and malformed AI output
 
 ## Screenshots
@@ -28,6 +30,7 @@ Built to show structured LLM evaluation in practice: rubric-based scoring, schem
 - Python 3.10+
 - [Streamlit](https://streamlit.io/) for the interface
 - [Google Gemini API](https://ai.google.dev/) via the official `google-genai` SDK
+- pandas for batch CSV handling
 - `python-dotenv` for configuration
 - `pytest` for tests (development only)
 
@@ -35,11 +38,15 @@ Built to show structured LLM evaluation in practice: rubric-based scoring, schem
 
 ```
 llm-response-evaluator/
-├── app.py              # Streamlit UI: inputs, verdict display, history, CSV export
-├── judge.py            # Rubric, judge prompt, verdict validation, position-bias logic
+├── app.py              # Streamlit UI: rubric editor, single and batch tabs, exports
+├── judge.py            # Default rubric, judge prompt, verdict validation, position-bias logic
+├── batch.py            # Batch CSV loading, running, summary statistics and export
+├── rubrics.py          # Rubric presets, validation, save/load as JSON
 ├── gemini_client.py    # Gemini API call, JSON parsing, friendly error handling
 ├── tests/
-│   └── test_judge.py   # Unit tests for validation and bias-check logic
+│   ├── test_judge.py   # Validation and bias-check logic
+│   ├── test_batch.py   # CSV loading, failure handling, win rates and averages
+│   └── test_rubrics.py # Rubric round-trip and validation
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
@@ -78,7 +85,7 @@ pip install pytest
 python -m pytest
 ```
 
-The tests cover verdict validation and the position-bias logic, and don't call the API.
+The tests cover verdict validation, the position-bias logic, batch processing and rubric files, and don't call the API.
 
 ## How it works
 
@@ -86,6 +93,14 @@ The tests cover verdict validation and the position-bias logic, and don't call t
 2. Gemini is asked to reply in a fixed JSON schema: a score for A and B on each criterion, reasoning, an overall winner and a summary. The temperature is kept low for more consistent judging.
 3. The reply is validated before display. Missing criteria, unknown winners or unreadable JSON produce a clear error instead of a misleading verdict.
 4. With the position-bias check on, the judge runs a second time with the responses swapped. The second result is mapped back to the original labels, scores are averaged, and the app reports whether the winner held.
+5. In batch mode, `batch.py` checks the CSV (column names are case-insensitive, blank rows are skipped and reported, up to 50 rows per run), judges each row with the current rubric, and summarises win rates and per-criterion averages. Rubrics are saved as a small JSON file (`name`, `version`, `criteria`) and validated on load: unique names, length limits and at most 8 criteria.
+
+### Batch CSV format
+
+```csv
+prompt,response_a,response_b,reference
+"What is 2 + 2?","4","2 + 2 is 5.","4"
+```
 
 ## Limitations
 
@@ -93,9 +108,9 @@ An LLM judge can be wrong, inconsistent, or swayed by length and style, so treat
 
 ## Future improvements
 
-- Batch mode: upload a CSV of prompt/response pairs and score them all
 - Compare verdicts from two different judge models
-- Let users edit criterion descriptions in the UI
+- Weighted criteria in the rubric
+- Run large batches in the background with rate-limit backoff
 
 ## License
 
